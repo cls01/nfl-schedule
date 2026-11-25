@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NFL Weekly Schedule</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; max-width: 900px; margin: 0 auto; padding: 16px; color: #1a1a1a; background: #fff; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  select, button { font-size: 1rem; padding: 8px 12px; }
+  button { background: #013369; color: #fff; border: 0; border-radius: 4px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  h2 { font-size: 1.05rem; border-bottom: 2px solid #013369; padding-bottom: 4px; margin-top: 24px; }
+  .wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #ddd; vertical-align: middle; }
+  .winner { font-weight: bold; }
+  .team { display: flex; align-items: center; gap: 8px; }
+  .score { display: flex; gap: 20px; white-space: nowrap; font-size: 1.15rem; }
+  .score .team { gap: 6px; }
+  .byes { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; margin-top: 16px; }
+  .team img { width: 28px; height: 28px; object-fit: contain; }
+</style>
+</head>
+<body>
+<h1>NFL Weekly Schedule</h1>
+<div class="controls">
+  <select id="week" aria-label="Week" disabled></select>
+  <button id="download" disabled>Download PDF</button>
+</div>
+<p id="status">Loading schedule...</p>
+<div id="schedule"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+<script>
+// ESPN's public scoreboard feed (unofficial, no API key needed)
+const API = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard";
+const COLUMNS = ["Date / Time", "Away", "Home", "Final Score"];
+
+// ESPN supplies the team's record on the competitor object, not team.team.
+function teamLabel(competitor) {
+  const records = competitor.records || competitor.team?.records || [];
+  const overall = records.find(r =>
+    r.name === "overall" || r.type === "total" || r.type === "overall"
+  ) || records[0];
+  const summary = overall?.summary || competitor.record?.summary || "";
+  const record = summary ? ` (${summary})` : "";
+  return `${competitor.team.displayName}${record}`;
+}
+
+const logoCache = new Map();   // logo URL -> promise of a small PNG for the PDF
+
+const $ = id => document.getElementById(id);
+let current = null;   // the week currently on screen
+let latestRequest = 0;
+
+async function getJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
+// Turn one ESPN event into a simple object
+function parseGame(event) {
+  const comp = event.competitions[0];
+  const home = comp.competitors.find(c => c.homeAway === "home");
+  const away = comp.competitors.find(c => c.homeAway === "away");
+  const date = new Date(event.date);
+  const type = (comp.status || event.status).type;
+  const timeTBD = comp.timeValid === false;
+
+  // Scores show only for finished games. Postponed and canceled games say so instead.
+  const calledOff = ["STATUS_POSTPONED", "STATUS_CANCELED"].includes(type.name);
+  let result = "";
+  let scores = null;   // [away, home], each shown beside that team's logo
+  if (calledOff) {
+    result = type.shortDetail;
+  } else if (type.completed) {
+    scores = [away, home].map(c => ({ abbr: c.team.abbreviation, points: String(c.score) }));
+    result = scores.map(t => `${t.abbr} ${t.points}`).join(", ");
+  }
+
+  // Which side won, so it can be bolded: 0 = away, 1 = home, -1 = nobody (not finished, or a tie)
+  const winnerSide = type.completed && !calledOff ? [away, home].findIndex(c => c.winner === true) : -1;
+
+  const neutral = comp.neutralSite ? " (neutral site)" : "";
+
+  const zone = timeTBD ? { timeZone: "America/New_York" } : {};
+  const day = date.toLocaleDateString("en-US", { weekday: "short", month: "numeric", day: "numeric", ...zone });
+  const time = timeTBD ? "TBD" : date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZoneName: "short" });
+
+  return {
+    date,
+    winnerSide,
+    scores,
+    logos: [away.team.logo, home.team.logo],
+    row: [
+      `${day} ${time}`,
+      teamLabel(away),
+      teamLabel(home) + neutral,
+      result
+    ]
+  };
+}
+
+function inOrder(games) {
+  return [...games].sort((a, b) => a.date - b.date);
+}
+
+// Only show the score column if at least one game has a score or status
+function visibleColumns(games) {
+  return games.some(g => g.row[3]) ? 4 : 3;
+}
+
+function el(tag, text) {
+  const node = document.createElement(tag);
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function render() {
+  const box = $("schedule");
+  box.replaceChildren();
+  const count = visibleColumns(current.games);
+
+  const table = el("table");
+  const header = table.insertRow();
+  COLUMNS.slice(0, count).forEach(c => header.appendChild(el("th", c)));
+  inOrder(current.games).forEach(g => {
+    const tr = table.insertRow();
+    g.row.slice(0, count).forEach((v, i) => {
+      const td = el("td");
+      if (i === 1 || i === 2) {
+        const team = el("div");
+        team.className = g.winnerSide === i - 1 ? "team winner" : "team";
+        const url = g.logos[i - 1];
+        if (url) {
+          const img = el("img");
+          img.src = url;
+          img.alt = "";
+          team.appendChild(img);
+        }
+        team.appendChild(el("span", v));
+        td.appendChild(team);
+      } else if (i === 3 && g.scores) {
+        const score = el("div");
+        score.className = "score";
+        g.scores.forEach((t, side) => {
+          const item = el("div");
+          item.className = g.winnerSide === side ? "team winner" : "team";
+          if (g.logos[side]) {
+            const img = el("img");
+            img.src = g.logos[side];
+            img.alt = t.abbr;
+            item.appendChild(img);
+          } else {
+            item.appendChild(el("span", t.abbr));
+          }
+          item.appendChild(el("span", t.points));
+          score.appendChild(item);
+        });
+        td.appendChild(score);
+      } else {
+        td.textContent = v;
+      }
+      tr.appendChild(td);
+    });
+  });
+  const wrap = el("div");
+  wrap.className = "wrap";
+  wrap.appendChild(table);
+  box.appendChild(wrap);
+  if (current.byes.length) {
+    const byes = el("div");
+    byes.className = "byes";
+    byes.appendChild(el("strong", "Bye:"));
+    current.byes.forEach(t => {
+      const item = el("div");
+      item.className = "team";
+      if (t.logo) {
+        const img = el("img");
+        img.src = t.logo;
+        img.alt = "";
+        item.appendChild(img);
+      }
+      item.appendChild(el("span", t.name));
+      byes.appendChild(item);
+    });
+    box.appendChild(byes);
+  }
+}
+
+// Download a logo and shrink it so the PDF stays small
+function loadLogo(url) {
+  if (!url) return Promise.resolve(null);
+  if (!logoCache.has(url)) {
+    logoCache.set(url, (async () => {
+      try {
+        const res = await fetch(url, { cache: "reload", signal: AbortSignal.timeout(8000) });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const bitmap = await createImageBitmap(await res.blob());
+        const canvas = document.createElement("canvas");
+        canvas.width = canvas.height = 96;
+        const scale = Math.min(96 / bitmap.width, 96 / bitmap.height);
+        const w = bitmap.width * scale, h = bitmap.height * scale;
+        canvas.getContext("2d").drawImage(bitmap, (96 - w) / 2, (96 - h) / 2, w, h);
+        return canvas.toDataURL("image/png");
+      } catch (err) {
+        console.warn("Logo failed to load:", url, err);
+        logoCache.delete(url);   // allow a retry next time
+        return null;
+      }
+    })());
+  }
+  return logoCache.get(url);
+}
+
+async function downloadPDF() {
+  if (!window.jspdf) {
+    alert("The PDF library didn't load. Check your connection and refresh.");
+    return;
+  }
+  const week = current;   // stays the same if the dropdown changes mid-download
+  const button = $("download");
+  button.disabled = true;
+  button.textContent = "Building PDF...";
+  try {
+    const games = inOrder(week.games);
+    const logos = await Promise.all(games.map(g => Promise.all(g.logos.map(loadLogo))));
+    const byeLogos = await Promise.all(week.byes.map(t => loadLogo(t.logo)));
+    buildPDF(week, games, logos, byeLogos);
+    if ([...logos.flat(), ...byeLogos].some(l => !l)) alert("The PDF was saved, but some logos couldn't be loaded.");
+  } catch (err) {
+    alert("Couldn't create the PDF: " + err.message);
+  } finally {
+    button.textContent = "Download PDF";
+    button.disabled = current.games.length === 0;
+  }
+}
+
+function buildPDF(week, games, logos, byeLogos) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: "landscape", unit: "pt", format: "letter", compress: true });
+  const count = visibleColumns(games);
+  const body = games.map(g => g.row.slice(0, count));
+
+  doc.setFontSize(16);
+  doc.text(`NFL Schedule - ${week.season} ${week.label}`, 36, 36);
+  doc.setFontSize(9);
+  doc.text("Generated " + new Date().toLocaleString("en-US"), 36, 52);
+
+  doc.autoTable({
+    head: [COLUMNS.slice(0, count)],
+    body,
+    startY: 62,
+    margin: { left: 36, right: 36, bottom: 36 },
+    styles: { fontSize: 8.5, cellPadding: 3.5, minCellHeight: 25, valign: "middle" },
+    headStyles: { fillColor: [1, 51, 105] },
+    columnStyles: {
+      0: { cellWidth: 120 },
+      // extra left padding leaves room for the logo
+      1: { cellWidth: count > 3 ? 220 : 300, cellPadding: { top: 3.5, right: 3.5, bottom: 3.5, left: 28 } },
+      2: { cellWidth: count > 3 ? 220 : 300, cellPadding: { top: 3.5, right: 3.5, bottom: 3.5, left: 28 } }
+    },
+    rowPageBreak: "avoid",
+    didParseCell: data => {
+      if (data.section !== "body") return;
+      const col = data.column.index;
+      if (col === 3 && games[data.row.index].scores) data.cell.text = [""];   // drawn with logos below
+      if (col > 0 && col === games[data.row.index].winnerSide + 1) data.cell.styles.fontStyle = "bold";
+    },
+    didDrawCell: data => {
+      const col = data.column.index;
+      if (data.section !== "body") return;
+      const game = games[data.row.index];
+      const mid = data.cell.y + data.cell.height / 2;
+      if (col === 3 && game.scores) {
+        game.scores.forEach((t, side) => {
+          const x = data.cell.x + 4 + side * 70;
+          const image = logos[data.row.index][side];
+          doc.setFontSize(12);
+          doc.setTextColor(20);
+          doc.setFont("helvetica", game.winnerSide === side ? "bold" : "normal");
+          if (image) {
+            doc.addImage(image, "PNG", x, mid - 10, 20, 20, game.logos[side]);
+            doc.text(t.points, x + 24, mid, { baseline: "middle" });
+          } else {
+            doc.text(`${t.abbr} ${t.points}`, x, mid, { baseline: "middle" });   // logo failed
+          }
+        });
+        return;
+      }
+      if (col !== 1 && col !== 2) return;
+      const logo = logos[data.row.index][col - 1];
+      if (!logo) return;
+      const url = games[data.row.index].logos[col - 1];   // alias: embed each logo once
+      doc.addImage(logo, "PNG", data.cell.x + 4, data.cell.y + (data.cell.height - 20) / 2, 20, 20, url);
+    }
+  });
+
+  if (week.byes.length) {
+    let y = doc.lastAutoTable.finalY + 20;   // vertical center of the current line
+    if (y + 12 > 576) { doc.addPage(); y = 48; }
+    doc.setFontSize(10);
+    doc.setTextColor(20);
+    doc.setFont("helvetica", "bold");
+    doc.text("Bye:", 36, y, { baseline: "middle" });
+    doc.setFont("helvetica", "normal");
+    let x = 68;
+    week.byes.forEach((t, i) => {
+      const image = byeLogos[i];
+      const textX = image ? 24 : 0;
+      const width = textX + doc.getTextWidth(t.name);
+      if (x + width > 756) { x = 68; y += 26; }   // wrap to the next line
+      if (y + 12 > 576) { doc.addPage(); y = 48; }
+      if (image) doc.addImage(image, "PNG", x, y - 10, 20, 20, t.logo);
+      doc.text(t.name, x + textX, y, { baseline: "middle" });
+      x += width + 18;
+    });
+  }
+
+  const slug = week.label.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  doc.save(`nfl-${week.season}-${slug}.pdf`);
+}
+
+function showWeek(data, label) {
+  current = {
+    label,
+    season: data.season.year,
+    games: (data.events || []).map(parseGame),
+    byes: ((data.week && data.week.teamsOnBye) || []).map(t => ({
+      name: t.displayName,
+      // fall back to ESPN's usual logo address if the bye list doesn't include one
+      logo: t.logo || t.logos?.[0]?.href ||
+        (t.abbreviation ? `https://a.espncdn.com/i/teamlogos/nfl/500/${t.abbreviation.toLowerCase()}.png` : null)
+    }))
+  };
+  render();
+  $("download").disabled = current.games.length === 0;
+  $("status").textContent = current.games.length
+    ? `${label}: ${current.games.length} games (times shown in your local time zone)`
+    : "No games found for this week.";
+}
+
+async function loadWeek(option) {
+  const request = ++latestRequest;
+  $("download").disabled = true;
+  $("schedule").replaceChildren();
+  $("status").textContent = "Loading schedule...";
+  try {
+    const { seasontype, week, year } = option.dataset;
+    const data = await getJSON(`${API}?seasontype=${seasontype}&week=${week}&dates=${year}`);
+    if (request === latestRequest) showWeek(data, option.textContent);
+  } catch (err) {
+    if (request === latestRequest) $("status").textContent = "Couldn't load that week: " + err.message;
+  }
+}
+
+async function init() {
+  try {
+    // With no parameters, the feed returns the current week
+    const data = await getJSON(API);
+    const league = data.leagues[0];
+    const select = $("week");
+
+    (league.calendar || []).forEach(period => {
+      (period.entries || []).forEach(entry => {
+        // 2 = regular season, 3 = playoffs
+        if (!["2", "3"].includes(String(period.value))) return;
+        const opt = el("option", entry.label);
+        Object.assign(opt.dataset, { seasontype: period.value, week: entry.value, year: data.season.year });
+        opt.selected = Number(period.value) === data.season.type && Number(entry.value) === data.week.number;
+        select.appendChild(opt);
+      });
+    });
+
+    const selected = [...select.options].find(o => o.selected && Number(o.dataset.week) === data.week.number
+      && Number(o.dataset.seasontype) === data.season.type);
+    if (!selected) select.selectedIndex = -1;
+    select.disabled = false;
+    showWeek(data, selected ? selected.textContent : "Week " + data.week.number);
+  } catch (err) {
+    $("status").textContent = "Couldn't load the schedule: " + err.message;
+  }
+}
+
+$("week").addEventListener("change", e => loadWeek(e.target.selectedOptions[0]));
+$("download").addEventListener("click", downloadPDF);
+init();
+</script>
+</body>
+</html>
